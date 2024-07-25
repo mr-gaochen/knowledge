@@ -7,11 +7,12 @@
     @desc:
 """
 import hashlib
+import json
 import os
 import re
 import uuid
 from functools import reduce
-from typing import Dict
+from typing import Dict, List
 
 from django.contrib.postgres.fields import ArrayField
 from django.core import cache, validators
@@ -22,26 +23,30 @@ from django.http import HttpResponse
 from django.template import Template, Context
 from rest_framework import serializers
 
-from application.models import Application, ApplicationDatasetMapping
+from application.flow.workflow_manage import Flow
+from application.models import Application, ApplicationDatasetMapping, ApplicationTypeChoices, WorkFlowVersion
 from application.models.api_key_model import ApplicationAccessToken, ApplicationApiKey
-from common.config.embedding_config import VectorStore, EmbeddingModel
+from common.cache_data.application_access_token_cache import get_application_access_token, del_application_access_token
+from common.cache_data.application_api_key_cache import del_application_api_key, get_application_api_key
+from common.config.embedding_config import VectorStore
 from common.constants.authentication_type import AuthenticationType
 from common.db.search import get_dynamics_model, native_search, native_page_search
 from common.db.sql_execute import select_list
 from common.exception.app_exception import AppApiException, NotFound404, AppUnauthorizedFailed
 from common.field.common import UploadedImageField
+from common.models.db_model_manage import DBModelManage
+from common.util.common import valid_license
 from common.util.field_message import ErrMessage
 from common.util.file_util import get_file_content
 from dataset.models import DataSet, Document, Image
-from dataset.serializers.common_serializers import list_paragraph
+from dataset.serializers.common_serializers import list_paragraph, get_embedding_model_by_dataset_id_list
 from embedding.models import SearchMode
 from setting.models import AuthOperate
 from setting.models.model_management import Model
 from setting.serializers.provider_serializers import ModelSerializer
 from smartdoc.conf import PROJECT_DIR
 
-token_cache = cache.caches['token_cache']
-chat_cache = cache.caches['model_cache']
+chat_cache = cache.caches['chat_cache']
 
 
 class ModelDatasetAssociation(serializers.Serializer):
@@ -91,7 +96,7 @@ class DatasetSettingSerializer(serializers.Serializer):
                                    error_messages=ErrMessage.float("引用分段数"))
     similarity = serializers.FloatField(required=True, max_value=1, min_value=0,
                                         error_messages=ErrMessage.float("相识度"))
-    max_paragraph_char_number = serializers.IntegerField(required=True, min_value=500, max_value=10000,
+    max_paragraph_char_number = serializers.IntegerField(required=True, min_value=500, max_value=100000,
                                                          error_messages=ErrMessage.integer("最多引用字符数"))
     search_mode = serializers.CharField(required=True, validators=[
         validators.RegexValidator(regex=re.compile("^embedding|keywords|blend$"),
@@ -105,6 +110,47 @@ class ModelSettingSerializer(serializers.Serializer):
     prompt = serializers.CharField(required=True, max_length=2048, error_messages=ErrMessage.char("提示词"))
 
 
+class ApplicationWorkflowSerializer(serializers.Serializer):
+    name = serializers.CharField(required=True, max_length=64, min_length=1, error_messages=ErrMessage.char("应用名称"))
+    desc = serializers.CharField(required=False, allow_null=True, allow_blank=True,
+                                 max_length=256, min_length=1,
+                                 error_messages=ErrMessage.char("应用描述"))
+    prologue = serializers.CharField(required=False, allow_null=True, allow_blank=True, max_length=4096,
+                                     error_messages=ErrMessage.char("开场白"))
+
+    @staticmethod
+    def to_application_model(user_id: str, application: Dict):
+
+        default_workflow_json = get_file_content(
+            os.path.join(PROJECT_DIR, "apps", "application", 'flow', 'default_workflow.json'))
+        default_workflow = json.loads(default_workflow_json)
+        for node in default_workflow.get('nodes'):
+            if node.get('id') == 'base-node':
+                node.get('properties')['node_data'] = {"desc": application.get('desc'),
+                                                       "name": application.get('name'),
+                                                       "prologue": application.get('prologue')}
+        return Application(id=uuid.uuid1(),
+                           name=application.get('name'),
+                           desc=application.get('desc'),
+                           prologue="",
+                           dialogue_number=0,
+                           user_id=user_id, model_id=None,
+                           dataset_setting={},
+                           model_setting={},
+                           problem_optimization=False,
+                           type=ApplicationTypeChoices.WORK_FLOW,
+                           work_flow=default_workflow
+                           )
+
+
+def get_base_node_work_flow(work_flow):
+    node_list = work_flow.get('nodes')
+    base_node_list = [node for node in node_list if node.get('id') == 'base-node']
+    if len(base_node_list) > 0:
+        return base_node_list[-1]
+    return None
+
+
 class ApplicationSerializer(serializers.Serializer):
     name = serializers.CharField(required=True, max_length=64, min_length=1, error_messages=ErrMessage.char("应用名称"))
     desc = serializers.CharField(required=False, allow_null=True, allow_blank=True,
@@ -113,7 +159,7 @@ class ApplicationSerializer(serializers.Serializer):
     model_id = serializers.CharField(required=False, allow_null=True, allow_blank=True,
                                      error_messages=ErrMessage.char("模型"))
     multiple_rounds_dialogue = serializers.BooleanField(required=True, error_messages=ErrMessage.char("多轮对话"))
-    prologue = serializers.CharField(required=False, allow_null=True, allow_blank=True, max_length=1024,
+    prologue = serializers.CharField(required=False, allow_null=True, allow_blank=True, max_length=4096,
                                      error_messages=ErrMessage.char("开场白"))
     dataset_id_list = serializers.ListSerializer(required=False, child=serializers.UUIDField(required=True),
                                                  allow_null=True, error_messages=ErrMessage.list("关联知识库"))
@@ -123,6 +169,13 @@ class ApplicationSerializer(serializers.Serializer):
     model_setting = ModelSettingSerializer(required=True)
     # 问题补全
     problem_optimization = serializers.BooleanField(required=True, error_messages=ErrMessage.boolean("问题补全"))
+    # 应用类型
+    type = serializers.CharField(required=True, error_messages=ErrMessage.char("应用类型"),
+                                 validators=[
+                                     validators.RegexValidator(regex=re.compile("^SIMPLE|WORK_FLOW$"),
+                                                               message="应用类型只支持SIMPLE|WORK_FLOW", code=500)
+                                 ]
+                                 )
 
     def is_valid(self, *, user_id=None, raise_exception=False):
         super().is_valid(raise_exception=True)
@@ -143,10 +196,20 @@ class ApplicationSerializer(serializers.Serializer):
             file.close()
             application_access_token = QuerySet(ApplicationAccessToken).filter(
                 access_token=self.data.get('token')).first()
+            is_draggable = 'false'
+            show_guide = 'true'
+            float_icon = f"{self.data.get('protocol')}://{self.data.get('host')}/ui/favicon.ico"
+            application_setting_model = DBModelManage.get_model('application_setting')
+            if application_setting_model is not None:
+                application_setting = QuerySet(application_setting_model).filter(
+                    application_id=application_access_token.application_id).first()
+                if application_setting is not None:
+                    is_draggable = 'true' if application_setting.draggable else 'false'
+                    if application_setting.float_icon is not None and len(application_setting.float_icon) > 0:
+                        float_icon = f"{self.data.get('protocol')}://{self.data.get('host')}{application_setting.float_icon}"
+                    show_guide = 'true' if application_setting.show_guide else 'false'
 
             is_auth = 'true' if application_access_token is not None and application_access_token.is_active else 'false'
-            application_access_token = QuerySet(ApplicationAccessToken).filter(
-                access_token=self.data.get('token')).first()
             t = Template(content)
             s = t.render(
                 Context(
@@ -154,7 +217,10 @@ class ApplicationSerializer(serializers.Serializer):
                      'token': self.data.get('token'),
                      'white_list_str': ",".join(
                          application_access_token.white_list),
-                     'white_active': 'true' if application_access_token.white_active else 'false'}))
+                     'white_active': 'true' if application_access_token.white_active else 'false',
+                     'is_draggable': is_draggable,
+                     'float_icon': float_icon,
+                     'show_guide': show_guide}))
             response = HttpResponse(s, status=200, headers={'Content-Type': 'text/javascript'})
             return response
 
@@ -187,6 +253,7 @@ class ApplicationSerializer(serializers.Serializer):
             if 'is_active' in instance:
                 application_access_token.is_active = instance.get("is_active")
             if 'access_token_reset' in instance and instance.get('access_token_reset'):
+                del_application_access_token(application_access_token.access_token)
                 application_access_token.access_token = hashlib.md5(str(uuid.uuid1()).encode()).hexdigest()[8:24]
             if 'access_num' in instance and instance.get('access_num') is not None:
                 application_access_token.access_num = instance.get("access_num")
@@ -197,6 +264,7 @@ class ApplicationSerializer(serializers.Serializer):
             if 'show_source' in instance and instance.get('show_source') is not None:
                 application_access_token.show_source = instance.get('show_source')
             application_access_token.save()
+            get_application_access_token(application_access_token.access_token, False)
             return self.one(with_valid=False)
 
         def one(self, with_valid=True):
@@ -260,7 +328,7 @@ class ApplicationSerializer(serializers.Serializer):
                                          error_messages=ErrMessage.char("模型"))
         multiple_rounds_dialogue = serializers.BooleanField(required=False,
                                                             error_messages=ErrMessage.boolean("多轮会话"))
-        prologue = serializers.CharField(required=False, allow_null=True, allow_blank=True, max_length=1024,
+        prologue = serializers.CharField(required=False, allow_null=True, allow_blank=True, max_length=4096,
                                          error_messages=ErrMessage.char("开场白"))
         dataset_id_list = serializers.ListSerializer(required=False, child=serializers.UUIDField(required=True),
                                                      error_messages=ErrMessage.list("关联知识库")
@@ -279,8 +347,28 @@ class ApplicationSerializer(serializers.Serializer):
     class Create(serializers.Serializer):
         user_id = serializers.UUIDField(required=True, error_messages=ErrMessage.uuid("用户id"))
 
+        @valid_license(model=Application, count=5,
+                       message='社区版最多支持 5 个应用，如需拥有更多应用，请联系我们（https://fit2cloud.com/）。')
         @transaction.atomic
         def insert(self, application: Dict):
+            application_type = application.get('type')
+            if 'WORK_FLOW' == application_type:
+                return self.insert_workflow(application)
+            else:
+                return self.insert_simple(application)
+
+        def insert_workflow(self, application: Dict):
+            self.is_valid(raise_exception=True)
+            user_id = self.data.get('user_id')
+            ApplicationWorkflowSerializer(data=application).is_valid(raise_exception=True)
+            application_model = ApplicationWorkflowSerializer.to_application_model(user_id, application)
+            application_model.save()
+            # 插入认证信息
+            ApplicationAccessToken(application_id=application_model.id,
+                                   access_token=hashlib.md5(str(uuid.uuid1()).encode()).hexdigest()[8:24]).save()
+            return ApplicationSerializerModel(application_model).data
+
+        def insert_simple(self, application: Dict):
             self.is_valid(raise_exception=True)
             user_id = self.data.get('user_id')
             ApplicationSerializer(data=application).is_valid(user_id=user_id, raise_exception=True)
@@ -296,7 +384,7 @@ class ApplicationSerializer(serializers.Serializer):
                                    access_token=hashlib.md5(str(uuid.uuid1()).encode()).hexdigest()[8:24]).save()
             # 插入关联数据
             QuerySet(ApplicationDatasetMapping).bulk_create(application_dataset_mapping_model_list)
-            return True
+            return ApplicationSerializerModel(application_model).data
 
         @staticmethod
         def to_application_model(user_id: str, application: Dict):
@@ -306,7 +394,9 @@ class ApplicationSerializer(serializers.Serializer):
                                user_id=user_id, model_id=application.get('model_id'),
                                dataset_setting=application.get('dataset_setting'),
                                model_setting=application.get('model_setting'),
-                               problem_optimization=application.get('problem_optimization')
+                               problem_optimization=application.get('problem_optimization'),
+                               type=ApplicationTypeChoices.SIMPLE,
+                               work_flow={}
                                )
 
         @staticmethod
@@ -317,9 +407,9 @@ class ApplicationSerializer(serializers.Serializer):
         id = serializers.CharField(required=True, error_messages=ErrMessage.uuid("应用id"))
         user_id = serializers.UUIDField(required=False, error_messages=ErrMessage.uuid("用户id"))
         query_text = serializers.CharField(required=True, error_messages=ErrMessage.char("查询文本"))
-        top_number = serializers.IntegerField(required=True, max_value=10, min_value=1,
+        top_number = serializers.IntegerField(required=True, max_value=100, min_value=1,
                                               error_messages=ErrMessage.integer("topN"))
-        similarity = serializers.FloatField(required=True, max_value=1, min_value=0,
+        similarity = serializers.FloatField(required=True, max_value=2, min_value=0,
                                             error_messages=ErrMessage.float("相关度"))
         search_mode = serializers.CharField(required=True, validators=[
             validators.RegexValidator(regex=re.compile("^embedding|keywords|blend$"),
@@ -337,17 +427,19 @@ class ApplicationSerializer(serializers.Serializer):
             dataset_id_list = [ad.dataset_id for ad in
                                QuerySet(ApplicationDatasetMapping).filter(
                                    application_id=self.data.get('id'))]
-
+            if len(dataset_id_list) == 0:
+                return []
             exclude_document_id_list = [str(document.id) for document in
                                         QuerySet(Document).filter(
                                             dataset_id__in=dataset_id_list,
                                             is_active=False)]
+            model = get_embedding_model_by_dataset_id_list(dataset_id_list)
             # 向量库检索
             hit_list = vector.hit_test(self.data.get('query_text'), dataset_id_list, exclude_document_id_list,
                                        self.data.get('top_number'),
                                        self.data.get('similarity'),
                                        SearchMode(self.data.get('search_mode')),
-                                       EmbeddingModel.get_embedding_model())
+                                       model)
             hit_dict = reduce(lambda x, y: {**x, **y}, [{hit.get('paragraph_id'): hit} for hit in hit_list], {})
             p_list = list_paragraph([h.get('paragraph_id') for h in hit_list])
             return [{**p, 'similarity': hit_dict.get(p.get('id')).get('similarity'),
@@ -420,7 +512,7 @@ class ApplicationSerializer(serializers.Serializer):
     class ApplicationModel(serializers.ModelSerializer):
         class Meta:
             model = Application
-            fields = ['id', 'name', 'desc', 'prologue', 'dialogue_number', 'icon']
+            fields = ['id', 'name', 'desc', 'prologue', 'dialogue_number', 'icon', 'type']
 
     class IconOperate(serializers.Serializer):
         application_id = serializers.UUIDField(required=True, error_messages=ErrMessage.uuid("应用id"))
@@ -438,6 +530,9 @@ class ApplicationSerializer(serializers.Serializer):
             image.save()
             application.icon = f'/api/image/{image_id}'
             application.save()
+            application_access_token = QuerySet(ApplicationAccessToken).filter(
+                application_id=self.data.get('application_id')).first()
+            get_application_access_token(application_access_token.access_token, False)
             return {**ApplicationSerializer.Query.reset_application(ApplicationSerializerModel(application).data)}
 
     class Operate(serializers.Serializer):
@@ -449,18 +544,47 @@ class ApplicationSerializer(serializers.Serializer):
             if not QuerySet(Application).filter(id=self.data.get('application_id')).exists():
                 raise AppApiException(500, '不存在的应用id')
 
-        def list_model(self, with_valid=True):
+        def list_model(self, model_type=None, with_valid=True):
             if with_valid:
                 self.is_valid()
+            if model_type is None:
+                model_type = "LLM"
             application = QuerySet(Application).filter(id=self.data.get("application_id")).first()
             return ModelSerializer.Query(
-                data={'user_id': application.user_id}).list(
+                data={'user_id': application.user_id, 'model_type': model_type}).list(
                 with_valid=True)
 
         def delete(self, with_valid=True):
             if with_valid:
                 self.is_valid()
             QuerySet(Application).filter(id=self.data.get('application_id')).delete()
+            return True
+
+        @transaction.atomic
+        def publish(self, instance, with_valid=True):
+            if with_valid:
+                self.is_valid()
+            application = QuerySet(Application).filter(id=self.data.get("application_id")).first()
+            work_flow = instance.get('work_flow')
+            if work_flow is None:
+                raise AppApiException(500, "work_flow是必填字段")
+            Flow.new_instance(work_flow).is_valid()
+            base_node = get_base_node_work_flow(work_flow)
+            if base_node is not None:
+                node_data = base_node.get('properties').get('node_data')
+                if node_data is not None:
+                    application.name = node_data.get('name')
+                    application.desc = node_data.get('desc')
+                    application.prologue = node_data.get('prologue')
+            dataset_list = self.list_dataset(with_valid=False)
+            application_dataset_id_list = [str(dataset.get('id')) for dataset in dataset_list]
+            dataset_id_list = self.update_reverse_search_node(work_flow, application_dataset_id_list)
+            application.work_flow = work_flow
+            application.save()
+            # 插入知识库关联关系
+            self.save_application_mapping(application_dataset_id_list, dataset_id_list, application.id)
+            work_flow_version = WorkFlowVersion(work_flow=work_flow, application=application)
+            work_flow_version.save()
             return True
 
         def one(self, with_valid=True):
@@ -474,8 +598,42 @@ class ApplicationSerializer(serializers.Serializer):
             dataset_id_list = [d.get('id') for d in
                                list(filter(lambda row: mapping_dataset_id_list.__contains__(row.get('id')),
                                            dataset_list))]
+            self.update_search_node(application.work_flow, [str(dataset.get('id')) for dataset in dataset_list])
             return {**ApplicationSerializer.Query.reset_application(ApplicationSerializerModel(application).data),
                     'dataset_id_list': dataset_id_list}
+
+        def get_search_node(self, work_flow):
+            if work_flow is None:
+                return []
+            return [node for node in work_flow.get('nodes', []) if node.get('type', '') == 'search-dataset-node']
+
+        def update_search_node(self, work_flow, user_dataset_id_list: List):
+            search_node_list = self.get_search_node(work_flow)
+            for search_node in search_node_list:
+                node_data = search_node.get('properties', {}).get('node_data', {})
+                dataset_id_list = node_data.get('dataset_id_list', [])
+                node_data['source_dataset_id_list'] = dataset_id_list
+                node_data['dataset_id_list'] = [dataset_id for dataset_id in dataset_id_list if
+                                                user_dataset_id_list.__contains__(dataset_id)]
+
+        def update_reverse_search_node(self, work_flow, user_dataset_id_list: List):
+            search_node_list = self.get_search_node(work_flow)
+            result_dataset_id_list = []
+            for search_node in search_node_list:
+                node_data = search_node.get('properties', {}).get('node_data', {})
+                dataset_id_list = node_data.get('dataset_id_list', [])
+                for dataset_id in dataset_id_list:
+                    if not user_dataset_id_list.__contains__(dataset_id):
+                        raise AppApiException(500, f"未知的知识库id${dataset_id},无法关联")
+
+                source_dataset_id_list = node_data.get('source_dataset_id_list', [])
+                source_dataset_id_list = [source_dataset_id for source_dataset_id in source_dataset_id_list if
+                                          not user_dataset_id_list.__contains__(source_dataset_id)]
+                source_dataset_id_list = list({*source_dataset_id_list, *dataset_id_list})
+                node_data['source_dataset_id_list'] = []
+                node_data['dataset_id_list'] = source_dataset_id_list
+                result_dataset_id_list = [*source_dataset_id_list, *result_dataset_id_list]
+            return list(set(result_dataset_id_list))
 
         def profile(self, with_valid=True):
             if with_valid:
@@ -489,6 +647,7 @@ class ApplicationSerializer(serializers.Serializer):
                 {**ApplicationSerializer.ApplicationModel(application).data,
                  'show_source': application_access_token.show_source})
 
+        @transaction.atomic
         def edit(self, instance: Dict, with_valid=True):
             if with_valid:
                 self.is_valid()
@@ -501,13 +660,20 @@ class ApplicationSerializer(serializers.Serializer):
                 application.model_id = None
             else:
                 model = QuerySet(Model).filter(
-                    id=instance.get('model_id'),
-                    user_id=application.user_id).first()
+                    id=instance.get('model_id')).first()
                 if model is None:
                     raise AppApiException(500, "模型不存在")
+                if not model.is_permission(application.user_id):
+                    raise AppApiException(500, f"沒有权限使用该模型:{model.name}")
+            if 'work_flow' in instance:
+                # 当前用户可修改关联的知识库列表
+                application_dataset_id_list = [str(dataset_dict.get('id')) for dataset_dict in
+                                               self.list_dataset(with_valid=False)]
+                self.update_reverse_search_node(instance.get('work_flow'), application_dataset_id_list)
+
             update_keys = ['name', 'desc', 'model_id', 'multiple_rounds_dialogue', 'prologue', 'status',
                            'dataset_setting', 'model_setting', 'problem_optimization',
-                           'api_key_is_active', 'icon']
+                           'api_key_is_active', 'icon', 'work_flow']
             for update_key in update_keys:
                 if update_key in instance and instance.get(update_key) is not None:
                     if update_key == 'multiple_rounds_dialogue':
@@ -525,15 +691,24 @@ class ApplicationSerializer(serializers.Serializer):
                     if not application_dataset_id_list.__contains__(dataset_id):
                         raise AppApiException(500, f"未知的知识库id${dataset_id},无法关联")
 
-                # 删除已经关联的id
-                QuerySet(ApplicationDatasetMapping).filter(dataset_id__in=application_dataset_id_list,
-                                                           application_id=application_id).delete()
-                # 插入
-                QuerySet(ApplicationDatasetMapping).bulk_create(
-                    [ApplicationDatasetMapping(application_id=application_id, dataset_id=dataset_id) for dataset_id in
-                     dataset_id_list]) if len(dataset_id_list) > 0 else None
+                self.save_application_mapping(application_dataset_id_list, dataset_id_list, application_id)
             chat_cache.clear_by_application_id(application_id)
+            application_access_token = QuerySet(ApplicationAccessToken).filter(application_id=application_id).first()
+            # 更新缓存数据
+            get_application_access_token(application_access_token.access_token, False)
             return self.one(with_valid=False)
+
+        @staticmethod
+        def save_application_mapping(application_dataset_id_list, dataset_id_list, application_id):
+            # 需要排除已删除的数据集
+            dataset_id_list = [dataset.id for dataset in QuerySet(DataSet).filter(id__in=dataset_id_list)]
+            # 删除已经关联的id
+            QuerySet(ApplicationDatasetMapping).filter(dataset_id__in=application_dataset_id_list,
+                                                       application_id=application_id).delete()
+            # 插入
+            QuerySet(ApplicationDatasetMapping).bulk_create(
+                [ApplicationDatasetMapping(application_id=application_id, dataset_id=dataset_id) for dataset_id in
+                 dataset_id_list]) if len(dataset_id_list) > 0 else None
 
         def list_dataset(self, with_valid=True):
             if with_valid:
@@ -602,8 +777,10 @@ class ApplicationSerializer(serializers.Serializer):
                     self.is_valid(raise_exception=True)
                 api_key_id = self.data.get("api_key_id")
                 application_id = self.data.get('application_id')
-                QuerySet(ApplicationApiKey).filter(id=api_key_id,
-                                                   application_id=application_id).delete()
+                application_api_key = QuerySet(ApplicationApiKey).filter(id=api_key_id,
+                                                                         application_id=application_id).first()
+                del_application_api_key(application_api_key.secret_key)
+                application_api_key.delete()
 
             def edit(self, instance, with_valid=True):
                 if with_valid:
@@ -622,3 +799,5 @@ class ApplicationSerializer(serializers.Serializer):
                 if 'cross_domain_list' in instance and instance.get('cross_domain_list') is not None:
                     application_api_key.cross_domain_list = instance.get('cross_domain_list')
                 application_api_key.save()
+                # 写入缓存
+                get_application_api_key(application_api_key.secret_key, False)

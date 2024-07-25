@@ -19,26 +19,16 @@ import os
 from django.http import HttpResponse
 from django.urls import path, re_path, include
 from django.views import static
-from drf_yasg import openapi
-from drf_yasg.views import get_schema_view
-from rest_framework import permissions, status
+from rest_framework import status
 
-from common.auth import AnonymousAuthentication
+from application.urls import urlpatterns as application_urlpatterns
+from common.cache_data.static_resource_cache import get_index_html
+from common.constants.cache_code_constants import CacheCodeConstants
+from common.init.init_doc import init_doc
 from common.response.result import Result
+from common.util.cache_util import get_cache
 from smartdoc import settings
 from smartdoc.conf import PROJECT_DIR
-
-schema_view = get_schema_view(
-
-    openapi.Info(
-        title="Python API",
-        default_version='v1',
-        description="智能客服平台",
-    ),
-    public=True,
-    permission_classes=[permissions.AllowAny],
-    authentication_classes=[AnonymousAuthentication]
-)
 
 urlpatterns = [
     path("api/", include("users.urls")),
@@ -70,23 +60,14 @@ def page_not_found(request, exception):
     """
     if request.path.startswith("/api/"):
         return Result(response_status=status.HTTP_404_NOT_FOUND, code=404, message="找不到接口")
-    else:
-        index_path = os.path.join(PROJECT_DIR, 'apps', "static", 'ui', 'index.html')
-        if not os.path.exists(index_path):
-            return HttpResponse("页面不存在", status=404)
-        file = open(index_path, "r", encoding='utf-8')
-        content = file.read()
-        file.close()
-        if request.path.startswith('/ui/chat/'):
-            return HttpResponse(content, status=200)
-        return HttpResponse(content, status=200, headers={'X-Frame-Options': 'DENY'})
+    index_path = os.path.join(PROJECT_DIR, 'apps', "static", 'ui', 'index.html')
+    if not os.path.exists(index_path):
+        return HttpResponse("页面不存在", status=404)
+    content = get_index_html(index_path)
+    if request.path.startswith('/ui/chat/'):
+        return HttpResponse(content, status=200)
+    return HttpResponse(content, status=200, headers={'X-Frame-Options': 'DENY'})
 
 
 handler404 = page_not_found
-
-urlpatterns += [
-    re_path(r'^doc(?P<format>\.json|\.yaml)$', schema_view.without_ui(cache_timeout=0),
-            name='schema-json'),  # 导出
-    path('doc/', schema_view.with_ui('swagger', cache_timeout=0), name='schema-swagger-ui'),
-    path('redoc/', schema_view.with_ui('redoc', cache_timeout=0), name='schema-redoc'),
-]
+init_doc(urlpatterns, application_urlpatterns)

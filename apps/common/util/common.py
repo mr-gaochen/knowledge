@@ -10,6 +10,11 @@ import importlib
 from functools import reduce
 from typing import Dict, List
 
+from django.conf import settings
+from django.db.models import QuerySet
+
+from ..exception.app_exception import AppApiException
+
 
 def sub_array(array: List, item_num=10):
     result = []
@@ -45,11 +50,39 @@ def get_exec_method(clazz_: str, method_: str):
     return getattr(getattr(package_model, clazz_name), method_)
 
 
+def flat_map(array: List[List]):
+    """
+    将二位数组转为一维数组
+    :param array: 二维数组
+    :return: 一维数组
+    """
+    result = []
+    for e in array:
+        result += e
+    return result
+
+
 def post(post_function):
     def inner(func):
         def run(*args, **kwargs):
             result = func(*args, **kwargs)
             return post_function(*result)
+
+        return run
+
+    return inner
+
+
+def valid_license(model=None, count=None, message=None):
+    def inner(func):
+        def run(*args, **kwargs):
+            if (not (settings.XPACK_LICENSE_IS_VALID if hasattr(settings,
+                                                                'XPACK_LICENSE_IS_VALID') else None)
+                    and QuerySet(
+                        model).count() >= count):
+                error = message or f'超出限制{count},请联系我们（https://fit2cloud.com/）。'
+                raise AppApiException(400, error)
+            return func(*args, **kwargs)
 
         return run
 

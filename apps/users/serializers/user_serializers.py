@@ -12,6 +12,7 @@ import random
 import re
 import uuid
 
+from django.conf import settings
 from django.core import validators, signing, cache
 from django.core.mail import send_mail
 from django.core.mail.backends.smtp import EmailBackend
@@ -29,6 +30,7 @@ from common.event import ListenerManagement
 from common.exception.app_exception import AppApiException
 from common.mixins.api_mixin import ApiMixin
 from common.response.result import get_api_response
+from common.util.common import valid_license
 from common.util.field_message import ErrMessage
 from common.util.lock import lock
 from dataset.models import DataSet, Document, Paragraph, Problem, ProblemParagraphMapping
@@ -43,7 +45,9 @@ class SystemSerializer(ApiMixin, serializers.Serializer):
     @staticmethod
     def get_profile():
         version = os.environ.get('MAXKB_VERSION')
-        return {'version': version}
+        return {'version': version, 'IS_XPACK': hasattr(settings, 'IS_XPACK'),
+                'XPACK_LICENSE_IS_VALID': (settings.XPACK_LICENSE_IS_VALID if hasattr(settings,
+                                                                                      'XPACK_LICENSE_IS_VALID') else False)}
 
     @staticmethod
     def get_response_body_api():
@@ -174,6 +178,8 @@ class RegisterSerializer(ApiMixin, serializers.Serializer):
 
         return True
 
+    @valid_license(model=User, count=2,
+                   message='社区版最多支持 2 个用户，如需拥有更多用户，请联系我们（https://fit2cloud.com/）。')
     @transaction.atomic
     def save(self, **kwargs):
         m = User(
@@ -491,7 +497,7 @@ class UserSerializer(ApiMixin, serializers.ModelSerializer):
 class UserInstanceSerializer(ApiMixin, serializers.ModelSerializer):
     class Meta:
         model = User
-        fields = ['id', 'username', 'email', 'phone', 'is_active', 'role', 'nick_name', 'create_time', 'update_time']
+        fields = ['id', 'username', 'email', 'phone', 'is_active', 'role', 'nick_name', 'create_time', 'update_time', 'source']
 
     @staticmethod
     def get_response_body_api():
@@ -506,6 +512,7 @@ class UserInstanceSerializer(ApiMixin, serializers.ModelSerializer):
                 'phone': openapi.Schema(type=openapi.TYPE_STRING, title="手机号", description="手机号"),
                 'is_active': openapi.Schema(type=openapi.TYPE_BOOLEAN, title="是否激活", description="是否激活"),
                 'role': openapi.Schema(type=openapi.TYPE_STRING, title="角色", description="角色"),
+                'source': openapi.Schema(type=openapi.TYPE_STRING, title="来源", description="来源"),
                 'nick_name': openapi.Schema(type=openapi.TYPE_STRING, title="姓名", description="姓名"),
                 'create_time': openapi.Schema(type=openapi.TYPE_STRING, title="创建时间", description="修改时间"),
                 'update_time': openapi.Schema(type=openapi.TYPE_STRING, title="修改时间", description="修改时间")
@@ -636,7 +643,7 @@ class UserManageSerializer(serializers.Serializer):
 
         def is_valid(self, *, user_id=None, raise_exception=False):
             super().is_valid(raise_exception=True)
-            if QuerySet(User).filter(email=self.data.get('email')).exclude(id=user_id).exists():
+            if self.data.get('email') is not None and QuerySet(User).filter(email=self.data.get('email')).exclude(id=user_id).exists():
                 raise AppApiException(1004, "邮箱已经被使用")
 
         @staticmethod
@@ -681,6 +688,8 @@ class UserManageSerializer(serializers.Serializer):
             if self.data.get('password') != self.data.get('re_password'):
                 raise ExceptionCodeConstants.PASSWORD_NOT_EQ_RE_PASSWORD.value.to_app_api_exception()
 
+    @valid_license(model=User, count=2,
+                   message='社区版最多支持 2 个用户，如需拥有更多用户，请联系我们（https://fit2cloud.com/）。')
     @transaction.atomic
     def save(self, instance, with_valid=True):
         if with_valid:
@@ -690,7 +699,7 @@ class UserManageSerializer(serializers.Serializer):
                     phone="" if instance.get('phone') is None else instance.get('phone'),
                     nick_name="" if instance.get('nick_name') is None else instance.get('nick_name')
                     , username=instance.get('username'), password=password_encrypt(instance.get('password')),
-                    role=RoleConstants.USER.name,
+                    role=RoleConstants.USER.name, source="LOCAL",
                     is_active=True)
         user.save()
         # 初始化用户团队

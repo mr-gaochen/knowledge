@@ -8,15 +8,29 @@
 """
 import threading
 from abc import ABC, abstractmethod
+from functools import reduce
 from typing import List, Dict
 
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_core.embeddings import Embeddings
 
-from common.config.embedding_config import EmbeddingModel
+from common.chunk import text_to_chunk
 from common.util.common import sub_array
 from embedding.models import SourceType, SearchMode
 
 lock = threading.Lock()
+
+
+def chunk_data(data: Dict):
+    if str(data.get('source_type')) == SourceType.PARAGRAPH.value:
+        text = data.get('text')
+        chunk_list = text_to_chunk(text)
+        return [{**data, 'text': chunk} for chunk in chunk_list]
+    return [data]
+
+
+def chunk_data_list(data_list: List[Dict]):
+    result = [chunk_data(data) for data in data_list]
+    return reduce(lambda x, y: [*x, *y], result, [])
 
 
 class BaseVectorStore(ABC):
@@ -51,7 +65,7 @@ class BaseVectorStore(ABC):
 
     def save(self, text, source_type: SourceType, dataset_id: str, document_id: str, paragraph_id: str, source_id: str,
              is_active: bool,
-             embedding=None):
+             embedding: Embeddings):
         """
         插入向量数据
         :param source_id:  资源id
@@ -64,13 +78,15 @@ class BaseVectorStore(ABC):
         :param paragraph_id 段落id
         :return:  bool
         """
-
-        if embedding is None:
-            embedding = EmbeddingModel.get_embedding_model()
         self.save_pre_handler()
-        self._save(text, source_type, dataset_id, document_id, paragraph_id, source_id, is_active, embedding)
+        data = {'document_id': document_id, 'paragraph_id': paragraph_id, 'dataset_id': dataset_id,
+                'is_active': is_active, 'source_id': source_id, 'source_type': source_type, 'text': text}
+        chunk_list = chunk_data(data)
+        result = sub_array(chunk_list)
+        for child_array in result:
+            self._batch_save(child_array, embedding)
 
-    def batch_save(self, data_list: List[Dict], embedding=None):
+    def batch_save(self, data_list: List[Dict], embedding: Embeddings):
         # 获取锁
         lock.acquire()
         try:
@@ -80,10 +96,9 @@ class BaseVectorStore(ABC):
             :param embedding: 向量化处理器
             :return: bool
             """
-            if embedding is None:
-                embedding = EmbeddingModel.get_embedding_model()
             self.save_pre_handler()
-            result = sub_array(data_list)
+            chunk_list = chunk_data_list(data_list)
+            result = sub_array(chunk_list)
             for child_array in result:
                 self._batch_save(child_array, embedding)
         finally:
@@ -94,17 +109,17 @@ class BaseVectorStore(ABC):
     @abstractmethod
     def _save(self, text, source_type: SourceType, dataset_id: str, document_id: str, paragraph_id: str, source_id: str,
               is_active: bool,
-              embedding: HuggingFaceEmbeddings):
+              embedding: Embeddings):
         pass
 
     @abstractmethod
-    def _batch_save(self, text_list: List[Dict], embedding: HuggingFaceEmbeddings):
+    def _batch_save(self, text_list: List[Dict], embedding: Embeddings):
         pass
 
     def search(self, query_text, dataset_id_list: list[str], exclude_document_id_list: list[str],
                exclude_paragraph_list: list[str],
                is_active: bool,
-               embedding: HuggingFaceEmbeddings):
+               embedding: Embeddings):
         if dataset_id_list is None or len(dataset_id_list) == 0:
             return []
         embedding_query = embedding.embed_query(query_text)
@@ -123,7 +138,7 @@ class BaseVectorStore(ABC):
     def hit_test(self, query_text, dataset_id: list[str], exclude_document_id_list: list[str], top_number: int,
                  similarity: float,
                  search_mode: SearchMode,
-                 embedding: HuggingFaceEmbeddings):
+                 embedding: Embeddings):
         pass
 
     @abstractmethod
@@ -140,14 +155,6 @@ class BaseVectorStore(ABC):
 
     @abstractmethod
     def update_by_source_ids(self, source_ids: List[str], instance: Dict):
-        pass
-
-    @abstractmethod
-    def embed_documents(self, text_list: List[str]):
-        pass
-
-    @abstractmethod
-    def embed_query(self, text: str):
         pass
 
     @abstractmethod

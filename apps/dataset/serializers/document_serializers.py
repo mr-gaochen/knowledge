@@ -14,29 +14,48 @@ import uuid
 from functools import reduce
 from typing import List, Dict
 
+import xlwt
 from django.core import validators
 from django.db import transaction
 from django.db.models import QuerySet
+from django.http import HttpResponse
 from drf_yasg import openapi
 from rest_framework import serializers
+from xlwt import Utils
 
 from common.db.search import native_search, native_page_search
 from common.event.common import work_thread_pool
 from common.event.listener_manage import ListenerManagement, SyncWebDocumentArgs, UpdateEmbeddingDatasetIdArgs
 from common.exception.app_exception import AppApiException
 from common.handle.impl.doc_split_handle import DocSplitHandle
+from common.handle.impl.html_split_handle import HTMLSplitHandle
 from common.handle.impl.pdf_split_handle import PdfSplitHandle
+from common.handle.impl.qa.csv_parse_qa_handle import CsvParseQAHandle
+from common.handle.impl.qa.xls_parse_qa_handle import XlsParseQAHandle
+from common.handle.impl.qa.xlsx_parse_qa_handle import XlsxParseQAHandle
 from common.handle.impl.text_split_handle import TextSplitHandle
 from common.mixins.api_mixin import ApiMixin
-from common.util.common import post
+from common.util.common import post, flat_map
 from common.util.field_message import ErrMessage
 from common.util.file_util import get_file_content
 from common.util.fork import Fork
 from common.util.split_model import get_split_model
 from dataset.models.data_set import DataSet, Document, Paragraph, Problem, Type, Status, ProblemParagraphMapping, Image
-from dataset.serializers.common_serializers import BatchSerializer, MetaSerializer
+from dataset.serializers.common_serializers import BatchSerializer, MetaSerializer, ProblemParagraphManage, \
+    get_embedding_model_by_dataset_id
 from dataset.serializers.paragraph_serializers import ParagraphSerializers, ParagraphInstanceSerializer
 from smartdoc.conf import PROJECT_DIR
+
+parse_qa_handle_list = [XlsParseQAHandle(), CsvParseQAHandle(), XlsxParseQAHandle()]
+
+
+class FileBufferHandle:
+    buffer = None
+
+    def get_buffer(self, file):
+        if self.buffer is None:
+            self.buffer = file.read()
+        return self.buffer
 
 
 class DocumentEditInstanceSerializer(ApiMixin, serializers.Serializer):
@@ -86,16 +105,19 @@ class DocumentWebInstanceSerializer(ApiMixin, serializers.Serializer):
                                          "选择器"))
 
     @staticmethod
-    def get_request_body_api():
-        return openapi.Schema(
-            type=openapi.TYPE_OBJECT,
-            required=['source_url_list'],
-            properties={
-                'source_url_list': openapi.Schema(type=openapi.TYPE_ARRAY, title="段落列表", description="段落列表",
-                                                  items=openapi.Schema(type=openapi.TYPE_STRING)),
-                'selector': openapi.Schema(type=openapi.TYPE_STRING, title="文档名称", description="文档名称")
-            }
-        )
+    def get_request_params_api():
+        return [openapi.Parameter(name='file',
+                                  in_=openapi.IN_FORM,
+                                  type=openapi.TYPE_ARRAY,
+                                  items=openapi.Items(type=openapi.TYPE_FILE),
+                                  required=True,
+                                  description='上传文件'),
+                openapi.Parameter(name='dataset_id',
+                                  in_=openapi.IN_PATH,
+                                  type=openapi.TYPE_STRING,
+                                  required=True,
+                                  description='知识库id'),
+                ]
 
 
 class DocumentInstanceSerializer(ApiMixin, serializers.Serializer):
@@ -119,7 +141,48 @@ class DocumentInstanceSerializer(ApiMixin, serializers.Serializer):
         )
 
 
+class DocumentInstanceQASerializer(ApiMixin, serializers.Serializer):
+    file_list = serializers.ListSerializer(required=True,
+                                           error_messages=ErrMessage.list("文件列表"),
+                                           child=serializers.FileField(required=True,
+                                                                       error_messages=ErrMessage.file("文件")))
+
+
 class DocumentSerializers(ApiMixin, serializers.Serializer):
+    class Export(ApiMixin, serializers.Serializer):
+        type = serializers.CharField(required=True, validators=[
+            validators.RegexValidator(regex=re.compile("^csv|excel$"),
+                                      message="模版类型只支持excel|csv",
+                                      code=500)
+        ], error_messages=ErrMessage.char("模版类型"))
+
+        @staticmethod
+        def get_request_params_api():
+            return [openapi.Parameter(name='type',
+                                      in_=openapi.IN_QUERY,
+                                      type=openapi.TYPE_STRING,
+                                      required=True,
+                                      description='导出模板类型csv|excel'),
+
+                    ]
+
+        def export(self, with_valid=True):
+            if with_valid:
+                self.is_valid(raise_exception=True)
+
+            if self.data.get('type') == 'csv':
+                file = open(os.path.join(PROJECT_DIR, "apps", "dataset", 'template', 'csv_template.csv'), "rb")
+                content = file.read()
+                file.close()
+                return HttpResponse(content, status=200, headers={'Content-Type': 'text/cxv',
+                                                                  'Content-Disposition': 'attachment; filename="csv_template.csv"'})
+            elif self.data.get('type') == 'excel':
+                file = open(os.path.join(PROJECT_DIR, "apps", "dataset", 'template', 'excel_template.xlsx'), "rb")
+                content = file.read()
+                file.close()
+                return HttpResponse(content, status=200, headers={'Content-Type': 'application/vnd.ms-excel',
+                                                                  'Content-Disposition': 'attachment; filename="excel_template.xlsx"'})
+
     class Migrate(ApiMixin, serializers.Serializer):
         dataset_id = serializers.UUIDField(required=True,
                                            error_messages=ErrMessage.char(
@@ -172,12 +235,17 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
                                      meta={})
             else:
                 document_list.update(dataset_id=target_dataset_id)
-            # 修改向量信息
-            ListenerManagement.update_embedding_dataset_id(UpdateEmbeddingDatasetIdArgs(
-                [paragraph.id for paragraph in paragraph_list],
-                target_dataset_id))
+            model = None
+            if dataset.embedding_mode_id != target_dataset.embedding_mode_id:
+                model = get_embedding_model_by_dataset_id(target_dataset_id)
+
+            pid_list = [paragraph.id for paragraph in paragraph_list]
             # 修改段落信息
             paragraph_list.update(dataset_id=target_dataset_id)
+            # 修改向量信息
+            ListenerManagement.update_embedding_dataset_id(UpdateEmbeddingDatasetIdArgs(
+                pid_list,
+                target_dataset_id, model))
 
         @staticmethod
         def get_target_dataset_problem(target_dataset_id: str,
@@ -318,8 +386,9 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
                     document_paragraph_model = DocumentSerializers.Create.get_paragraph_model(document, paragraphs)
 
                     paragraph_model_list = document_paragraph_model.get('paragraph_model_list')
-                    problem_model_list = document_paragraph_model.get('problem_model_list')
-                    problem_paragraph_mapping_list = document_paragraph_model.get('problem_paragraph_mapping_list')
+                    problem_paragraph_object_list = document_paragraph_model.get('problem_paragraph_object_list')
+                    problem_model_list, problem_paragraph_mapping_list = ProblemParagraphManage(
+                        problem_paragraph_object_list, document.dataset_id).to_problem_model_list()
                     # 批量插入段落
                     QuerySet(Paragraph).bulk_create(paragraph_model_list) if len(paragraph_model_list) > 0 else None
                     # 批量插入问题
@@ -329,7 +398,8 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
                         problem_paragraph_mapping_list) > 0 else None
                     # 向量化
                     if with_embedding:
-                        ListenerManagement.embedding_by_document_signal.send(document_id)
+                        model = get_embedding_model_by_dataset_id(dataset_id=document.dataset_id)
+                        ListenerManagement.embedding_by_document_signal.send(document_id, embedding_model=model)
                 else:
                     document.status = Status.error
                     document.save()
@@ -342,6 +412,7 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
     class Operate(ApiMixin, serializers.Serializer):
         document_id = serializers.UUIDField(required=True, error_messages=ErrMessage.char(
             "文档id"))
+        dataset_id = serializers.UUIDField(required=True, error_messages=ErrMessage.char("数据集id"))
 
         @staticmethod
         def get_request_params_api():
@@ -362,6 +433,85 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
             document_id = self.data.get('document_id')
             if not QuerySet(Document).filter(id=document_id).exists():
                 raise AppApiException(500, "文档id不存在")
+
+        def export(self, with_valid=True):
+            if with_valid:
+                self.is_valid(raise_exception=True)
+            document = QuerySet(Document).filter(id=self.data.get("document_id")).first()
+            paragraph_list = native_search(QuerySet(Paragraph).filter(document_id=self.data.get("document_id")),
+                                           get_file_content(
+                                               os.path.join(PROJECT_DIR, "apps", "dataset", 'sql',
+                                                            'list_paragraph_document_name.sql')))
+            problem_mapping_list = native_search(
+                QuerySet(ProblemParagraphMapping).filter(document_id=self.data.get("document_id")), get_file_content(
+                    os.path.join(PROJECT_DIR, "apps", "dataset", 'sql', 'list_problem_mapping.sql')),
+                with_table_name=True)
+            data_dict, document_dict = self.merge_problem(paragraph_list, problem_mapping_list, [document])
+            workbook = self.get_workbook(data_dict, document_dict)
+            response = HttpResponse(content_type='application/vnd.ms-excel')
+            response['Content-Disposition'] = f'attachment; filename="data.xls"'
+            workbook.save(response)
+            return response
+
+        @staticmethod
+        def get_workbook(data_dict, document_dict):
+            # 创建工作簿对象
+            workbook = xlwt.Workbook(encoding='utf-8')
+            for sheet_id in data_dict:
+                # 添加工作表
+                worksheet = workbook.add_sheet(document_dict.get(sheet_id))
+                data = [
+                    ['分段标题（选填）', '分段内容（必填，问题答案，最长不超过4096个字符）', '问题（选填，单元格内一行一个）'],
+                    *data_dict.get(sheet_id)
+                ]
+                # 写入数据到工作表
+                for row_idx, row in enumerate(data):
+                    for col_idx, col in enumerate(row):
+                        worksheet.write(row_idx, col_idx, col)
+                    # 创建HttpResponse对象返回Excel文件
+            return workbook
+
+        @staticmethod
+        def merge_problem(paragraph_list: List[Dict], problem_mapping_list: List[Dict], document_list):
+            result = {}
+            document_dict = {}
+
+            for paragraph in paragraph_list:
+                problem_list = [problem_mapping.get('content') for problem_mapping in problem_mapping_list if
+                                problem_mapping.get('paragraph_id') == paragraph.get('id')]
+                document_sheet = result.get(paragraph.get('document_id'))
+                document_name = DocumentSerializers.Operate.reset_document_name(paragraph.get('document_name'))
+                d = document_dict.get(document_name)
+                if d is None:
+                    document_dict[document_name] = {paragraph.get('document_id')}
+                else:
+                    d.add(paragraph.get('document_id'))
+
+                if document_sheet is None:
+                    result[paragraph.get('document_id')] = [[paragraph.get('title'), paragraph.get('content'),
+                                                             '\n'.join(problem_list)]]
+                else:
+                    document_sheet.append([paragraph.get('title'), paragraph.get('content'), '\n'.join(problem_list)])
+            for document in document_list:
+                if document.id not in result:
+                    document_name = DocumentSerializers.Operate.reset_document_name(document.name)
+                    result[document.id] = [[]]
+                    d = document_dict.get(document_name)
+                    if d is None:
+                        document_dict[document_name] = {document.id}
+                    else:
+                        d.add(document.id)
+            result_document_dict = {}
+            for d_name in document_dict:
+                for index, d_id in enumerate(document_dict.get(d_name)):
+                    result_document_dict[d_id] = d_name if index == 0 else d_name + str(index)
+            return result, result_document_dict
+
+        @staticmethod
+        def reset_document_name(document_name):
+            if document_name is None or not Utils.valid_sheet_name(document_name):
+                return "Sheet"
+            return document_name.strip()
 
         def one(self, with_valid=False):
             if with_valid:
@@ -388,18 +538,8 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
             if with_valid:
                 self.is_valid(raise_exception=True)
             document_id = self.data.get("document_id")
-            document = QuerySet(Document).filter(id=document_id).first()
-            if document.type == Type.web:
-                # 异步同步
-                work_thread_pool.submit(lambda x: DocumentSerializers.Sync(data={'document_id': document_id}).sync(),
-                                        {})
-
-            else:
-                if document.status != Status.embedding.value:
-                    document.status = Status.embedding
-                    document.save()
-                ListenerManagement.embedding_by_document_signal.send(document_id)
-            return True
+            model = get_embedding_model_by_dataset_id(dataset_id=self.data.get('dataset_id'))
+            ListenerManagement.embedding_by_document_signal.send(document_id, embedding_model=model)
 
         @transaction.atomic
         def delete(self):
@@ -468,9 +608,26 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
             return True
 
         @staticmethod
-        def post_embedding(result, document_id):
-            ListenerManagement.embedding_by_document_signal.send(document_id)
+        def post_embedding(result, document_id, dataset_id):
+            model = get_embedding_model_by_dataset_id(dataset_id)
+            ListenerManagement.embedding_by_document_signal.send(document_id, embedding_model=model)
             return result
+
+        @staticmethod
+        def parse_qa_file(file):
+            get_buffer = FileBufferHandle().get_buffer
+            for parse_qa_handle in parse_qa_handle_list:
+                if parse_qa_handle.support(file, get_buffer):
+                    return parse_qa_handle.handle(file, get_buffer)
+            raise AppApiException(500, '不支持的文件格式')
+
+        def save_qa(self, instance: Dict, with_valid=True):
+            if with_valid:
+                DocumentInstanceQASerializer(data=instance).is_valid(raise_exception=True)
+                self.is_valid(raise_exception=True)
+            file_list = instance.get('file_list')
+            document_list = flat_map([self.parse_qa_file(file) for file in file_list])
+            return DocumentSerializers.Batch(data={'dataset_id': self.data.get('dataset_id')}).batch_save(document_list)
 
         @post(post_function=post_embedding)
         @transaction.atomic
@@ -480,11 +637,13 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
                 self.is_valid(raise_exception=True)
             dataset_id = self.data.get('dataset_id')
             document_paragraph_model = self.get_document_paragraph_model(dataset_id, instance)
+
             document_model = document_paragraph_model.get('document')
             paragraph_model_list = document_paragraph_model.get('paragraph_model_list')
-            problem_model_list = document_paragraph_model.get('problem_model_list')
-            problem_paragraph_mapping_list = document_paragraph_model.get('problem_paragraph_mapping_list')
-
+            problem_paragraph_object_list = document_paragraph_model.get('problem_paragraph_object_list')
+            problem_model_list, problem_paragraph_mapping_list = (ProblemParagraphManage(problem_paragraph_object_list,
+                                                                                         dataset_id)
+                                                                  .to_problem_model_list())
             # 插入文档
             document_model.save()
             # 批量插入段落
@@ -497,7 +656,7 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
             document_id = str(document_model.id)
             return DocumentSerializers.Operate(
                 data={'dataset_id': dataset_id, 'document_id': document_id}).one(
-                with_valid=True), document_id
+                with_valid=True), document_id, dataset_id
 
         @staticmethod
         def get_sync_handler(dataset_id):
@@ -507,13 +666,13 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
                         paragraphs = get_split_model('web.md').parse(response.content)
                         # 插入
                         DocumentSerializers.Create(data={'dataset_id': dataset_id}).save(
-                            {'name': source_url, 'paragraphs': paragraphs,
+                            {'name': source_url[0:128], 'paragraphs': paragraphs,
                              'meta': {'source_url': source_url, 'selector': selector},
                              'type': Type.web}, with_valid=True)
                     except Exception as e:
                         logging.getLogger("max_kb_error").error(f'{str(e)}:{traceback.format_exc()}')
                 else:
-                    Document(name=source_url,
+                    Document(name=source_url[0:128],
                              meta={'source_url': source_url, 'selector': selector},
                              type=Type.web,
                              char_length=0,
@@ -539,35 +698,15 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
                 dataset_id, document_model.id, paragraph) for paragraph in paragraph_list]
 
             paragraph_model_list = []
-            problem_model_list = []
-            problem_paragraph_mapping_list = []
+            problem_paragraph_object_list = []
             for paragraphs in paragraph_model_dict_list:
                 paragraph = paragraphs.get('paragraph')
-                for problem_model in paragraphs.get('problem_model_list'):
-                    problem_model_list.append(problem_model)
-                for problem_paragraph_mapping in paragraphs.get('problem_paragraph_mapping_list'):
-                    problem_paragraph_mapping_list.append(problem_paragraph_mapping)
+                for problem_model in paragraphs.get('problem_paragraph_object_list'):
+                    problem_paragraph_object_list.append(problem_model)
                 paragraph_model_list.append(paragraph)
 
-            problem_model_list, problem_paragraph_mapping_list = DocumentSerializers.Create.reset_problem_model(
-                problem_model_list, problem_paragraph_mapping_list)
-
             return {'document': document_model, 'paragraph_model_list': paragraph_model_list,
-                    'problem_model_list': problem_model_list,
-                    'problem_paragraph_mapping_list': problem_paragraph_mapping_list}
-
-        @staticmethod
-        def reset_problem_model(problem_model_list, problem_paragraph_mapping_list):
-            new_problem_model_list = [x for i, x in enumerate(problem_model_list) if
-                                      len([item for item in problem_model_list[:i] if item.content == x.content]) <= 0]
-
-            for new_problem_model in new_problem_model_list:
-                old_model_list = [problem.id for problem in problem_model_list if
-                                  problem.content == new_problem_model.content]
-                for problem_paragraph_mapping in problem_paragraph_mapping_list:
-                    if old_model_list.__contains__(problem_paragraph_mapping.problem_id):
-                        problem_paragraph_mapping.problem_id = new_problem_model.id
-            return new_problem_model_list, problem_paragraph_mapping_list
+                    'problem_paragraph_object_list': problem_paragraph_object_list}
 
         @staticmethod
         def get_document_paragraph_model(dataset_id, instance: Dict):
@@ -661,7 +800,7 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
                     {'key': '#####', 'value': "(?<=\\n)(?<!#)##### (?!#).*|(?<=^)(?<!#)##### (?!#).*"},
                     {'key': '######', 'value': "(?<=\\n)(?<!#)###### (?!#).*|(?<=^)(?<!#)###### (?!#).*"},
                     {'key': '-', 'value': '(?<! )- .*'},
-                    {'key': '空格', 'value': '(?<!\\s)\\s(?!\\s)'},
+                    {'key': '空格', 'value': '(?<! ) (?! )'},
                     {'key': '分号', 'value': '(?<!；)；(?!；)'}, {'key': '逗号', 'value': '(?<!，)，(?!，)'},
                     {'key': '句号', 'value': '(?<!。)。(?!。)'}, {'key': '回车', 'value': '(?<!\\n)\\n(?!\\n)'},
                     {'key': '空行', 'value': '(?<!\\n)\\n\\n(?!\\n)'}]
@@ -674,9 +813,10 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
             return openapi.Schema(type=openapi.TYPE_ARRAY, items=DocumentSerializers.Create.get_request_body_api())
 
         @staticmethod
-        def post_embedding(document_list):
+        def post_embedding(document_list, dataset_id):
             for document_dict in document_list:
-                ListenerManagement.embedding_by_document_signal.send(document_dict.get('id'))
+                model = get_embedding_model_by_dataset_id(dataset_id)
+                ListenerManagement.embedding_by_document_signal.send(document_dict.get('id'), embedding_model=model)
             return document_list
 
         @post(post_function=post_embedding)
@@ -688,8 +828,7 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
             dataset_id = self.data.get("dataset_id")
             document_model_list = []
             paragraph_model_list = []
-            problem_model_list = []
-            problem_paragraph_mapping_list = []
+            problem_paragraph_object_list = []
             # 插入文档
             for document in instance_list:
                 document_paragraph_dict_model = DocumentSerializers.Create.get_document_paragraph_model(dataset_id,
@@ -697,11 +836,12 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
                 document_model_list.append(document_paragraph_dict_model.get('document'))
                 for paragraph in document_paragraph_dict_model.get('paragraph_model_list'):
                     paragraph_model_list.append(paragraph)
-                for problem in document_paragraph_dict_model.get('problem_model_list'):
-                    problem_model_list.append(problem)
-                for problem_paragraph_mapping in document_paragraph_dict_model.get('problem_paragraph_mapping_list'):
-                    problem_paragraph_mapping_list.append(problem_paragraph_mapping)
+                for problem_paragraph_object in document_paragraph_dict_model.get('problem_paragraph_object_list'):
+                    problem_paragraph_object_list.append(problem_paragraph_object)
 
+            problem_model_list, problem_paragraph_mapping_list = (ProblemParagraphManage(problem_paragraph_object_list,
+                                                                                         dataset_id)
+                                                                  .to_problem_model_list())
             # 插入文档
             QuerySet(Document).bulk_create(document_model_list) if len(document_model_list) > 0 else None
             # 批量插入段落
@@ -713,9 +853,12 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
                 problem_paragraph_mapping_list) > 0 else None
             # 查询文档
             query_set = QuerySet(model=Document)
+            if len(document_model_list) == 0:
+                return [],
             query_set = query_set.filter(**{'id__in': [d.id for d in document_model_list]})
             return native_search(query_set, select_string=get_file_content(
-                os.path.join(PROJECT_DIR, "apps", "dataset", 'sql', 'list_document.sql')), with_search_one=False),
+                os.path.join(PROJECT_DIR, "apps", "dataset", 'sql', 'list_document.sql')),
+                                 with_search_one=False), dataset_id
 
         @staticmethod
         def _batch_sync(document_id_list: List[str]):
@@ -772,7 +915,7 @@ class FileBufferHandle:
 
 
 default_split_handle = TextSplitHandle()
-split_handles = [DocSplitHandle(), PdfSplitHandle(), default_split_handle]
+split_handles = [HTMLSplitHandle(), DocSplitHandle(), PdfSplitHandle(), default_split_handle]
 
 
 def save_image(image_list):

@@ -38,7 +38,8 @@ INSTALLED_APPS = [
     'rest_framework',
     "drf_yasg",  # swagger 接口
     'django_filters',  # 条件过滤
-    'django_apscheduler'
+    'django_apscheduler',
+    'common'
 
 ]
 
@@ -91,9 +92,21 @@ SWAGGER_SETTINGS = {
 CACHES = {
     "default": {
         'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'unique-snowflake',
+        'TIMEOUT': 60 * 30,
+        'OPTIONS': {
+            'MAX_ENTRIES': 150,
+            'CULL_FREQUENCY': 5,
+        }
     },
-    'model_cache': {
-        'BACKEND': 'common.cache.mem_cache.MemCache'
+    'chat_cache': {
+        'BACKEND': 'common.cache.mem_cache.MemCache',
+        'LOCATION': 'unique-snowflake',
+        'TIMEOUT': 60 * 30,
+        'OPTIONS': {
+            'MAX_ENTRIES': 150,
+            'CULL_FREQUENCY': 5,
+        }
     },
     # 存储用户信息
     'user_cache': {
@@ -104,9 +117,6 @@ CACHES = {
     "token_cache": {
         'BACKEND': 'common.cache.file_cache.FileCache',
         'LOCATION': os.path.join(PROJECT_DIR, 'data', 'cache', "token_cache")  # 文件夹路径
-    },
-    "chat_cache": {
-        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
     }
 }
 

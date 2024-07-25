@@ -1,11 +1,29 @@
 <template>
-  <div class="chat-embed" v-loading="loading" @click="closePopover($event)">
-    <div class="chat-embed__header">
-      <div class="chat-width">
-        <h4 class="ml-24">{{ applicationDetail?.name }}</h4>
+  <div class="chat-embed layout-bg" v-loading="loading">
+    <div class="chat-embed__header" :class="!isDefaultTheme ? 'custom-header' : ''">
+      <div class="chat-width flex align-center">
+        <div class="mr-12 ml-24">
+          <AppAvatar
+            v-if="isAppIcon(applicationDetail?.icon)"
+            shape="square"
+            :size="32"
+            style="background: none"
+          >
+            <img :src="applicationDetail?.icon" alt="" />
+          </AppAvatar>
+          <AppAvatar
+            v-else-if="applicationDetail?.name"
+            :name="applicationDetail?.name"
+            pinyinColor
+            shape="square"
+            :size="32"
+          />
+        </div>
+
+        <h4>{{ applicationDetail?.name }}</h4>
       </div>
     </div>
-    <div class="chat-embed__main chat-width">
+    <div class="chat-embed__main">
       <AiChat
         ref="AiChatRef"
         v-model:data="applicationDetail"
@@ -15,19 +33,27 @@
         :chatId="currentChatId"
         @refresh="refresh"
         @scroll="handleScroll"
-      ></AiChat>
+        class="AiChat-embed"
+      >
+        <template #operateBefore>
+          <el-button type="primary" link class="new-chat-button mb-8" @click="newChat">
+            <el-icon><Plus /></el-icon><span class="ml-4">新建对话</span>
+          </el-button>
+        </template>
+      </AiChat>
     </div>
 
-    <el-button type="primary" link class="new-chat-button" @click="newChat">
-      <el-icon><Plus /></el-icon><span class="ml-4">新建对话</span>
-    </el-button>
     <!-- 历史记录弹出层 -->
-    <div @click.prevent.stop="show = !show" class="chat-popover-button cursor color-secondary">
+    <div
+      v-if="applicationDetail.show_history"
+      @click.prevent.stop="show = !show"
+      class="chat-popover-button cursor color-secondary"
+    >
       <AppIcon iconName="app-history-outlined"></AppIcon>
     </div>
 
     <el-collapse-transition>
-      <div v-show="show" class="chat-popover w-full" id="chat-popover">
+      <div v-show="show" class="chat-popover w-full" v-click-outside="clickoutside">
         <div class="border-b p-16-24">
           <span>历史记录</span>
         </div>
@@ -39,11 +65,20 @@
               v-loading="left_loading"
               :defaultActive="currentChatId"
               @click="clickListHandle"
+              @mouseenter="mouseenter"
+              @mouseleave="mouseId = ''"
             >
               <template #default="{ row }">
-                <auto-tooltip :content="row.abstract">
-                  {{ row.abstract }}
-                </auto-tooltip>
+                <div class="flex-between">
+                  <auto-tooltip :content="row.abstract">
+                    {{ row.abstract }}
+                  </auto-tooltip>
+                  <div @click.stop v-if="mouseId === row.id && row.id !== 'new'">
+                    <el-button style="padding: 0" link @click.stop="deleteLog(row)">
+                      <el-icon><Delete /></el-icon>
+                    </el-button>
+                  </div>
+                </div>
               </template>
               <template #empty>
                 <div class="text-center">
@@ -62,9 +97,9 @@
   </div>
 </template>
 <script setup lang="ts">
-import { ref, onMounted, reactive, nextTick } from 'vue'
+import { ref, onMounted, reactive, nextTick, computed } from 'vue'
 import { useRoute } from 'vue-router'
-import applicationApi from '@/api/application'
+import { isAppIcon } from '@/utils/application'
 import useStore from '@/stores'
 const route = useRoute()
 const {
@@ -72,6 +107,10 @@ const {
 } = route as any
 
 const { application, user, log } = useStore()
+
+const isDefaultTheme = computed(() => {
+  return user.isDefaultTheme()
+})
 
 const AiChatRef = ref()
 const loading = ref(false)
@@ -90,6 +129,23 @@ const paginationConfig = reactive({
 const currentRecordList = ref<any>([])
 const currentChatId = ref('new') // 当前历史记录Id 默认为'new'
 
+const mouseId = ref('')
+
+function mouseenter(row: any) {
+  mouseId.value = row.id
+}
+function deleteLog(row: any) {
+  log.asyncDelChatClientLog(applicationDetail.value.id, row.id, left_loading).then(() => {
+    if (currentChatId.value === row.id) {
+      currentChatId.value = 'new'
+      paginationConfig.current_page = 1
+      paginationConfig.total = 0
+      currentRecordList.value = []
+    }
+    getChatLog(applicationDetail.value.id)
+  })
+}
+
 function handleScroll(event: any) {
   if (
     currentChatId.value !== 'new' &&
@@ -104,13 +160,8 @@ function handleScroll(event: any) {
   }
 }
 
-function closePopover(event: any) {
-  const popover = document.getElementById('chat-popover')
-  if (popover) {
-    if (!popover.contains(event.target)) {
-      show.value = false
-    }
-  }
+function clickoutside() {
+  show.value = false
 }
 
 function newChat() {
@@ -123,18 +174,22 @@ function getAccessToken(token: string) {
   application
     .asyncAppAuthentication(token, loading)
     .then(() => {
-      getProfile()
+      setTimeout(() => {
+        getAppProfile()
+      }, 500)
     })
     .catch(() => {
       applicationAvailable.value = false
     })
 }
-function getProfile() {
-  applicationApi
-    .getProfile(loading)
-    .then((res) => {
+function getAppProfile() {
+  application
+    .asyncGetAppProfile(loading)
+    .then((res: any) => {
       applicationDetail.value = res.data
-      getChatLog(applicationDetail.value.id)
+      if (res.data?.show_history) {
+        getChatLog(applicationDetail.value.id)
+      }
     })
     .catch(() => {
       applicationAvailable.value = false
@@ -204,7 +259,6 @@ onMounted(() => {
 </script>
 <style lang="scss">
 .chat-embed {
-  background-color: var(--app-layout-bg-color);
   overflow: hidden;
   &__header {
     background: var(--app-header-bg-color);
@@ -224,9 +278,6 @@ onMounted(() => {
     overflow: hidden;
   }
   .new-chat-button {
-    position: absolute;
-    bottom: 84px;
-    left: 18px;
     z-index: 11;
   }
   // 历史对话弹出层
@@ -278,9 +329,10 @@ onMounted(() => {
       top: 50%;
     }
   }
-  .chat-width {
-    max-width: var(--app-chat-width, 860px);
-    margin: 0 auto;
+  .AiChat-embed {
+    .ai-chat__operate {
+      padding-top: 12px;
+    }
   }
 }
 </style>

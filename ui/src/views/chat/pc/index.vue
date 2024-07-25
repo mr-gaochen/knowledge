@@ -1,7 +1,27 @@
 <template>
-  <div class="chat-pc" :class="classObj" v-loading="loading">
-    <div class="chat-pc__header">
-      <h4 class="ml-24">{{ applicationDetail?.name }}</h4>
+  <div class="chat-pc layout-bg" :class="classObj" v-loading="loading">
+    <div class="chat-pc__header" :class="!isDefaultTheme ? 'custom-header' : ''">
+      <div class="flex align-center">
+        <div class="mr-12 ml-24">
+          <AppAvatar
+            v-if="isAppIcon(applicationDetail?.icon)"
+            shape="square"
+            :size="32"
+            style="background: none"
+          >
+            <img :src="applicationDetail?.icon" alt="" />
+          </AppAvatar>
+          <AppAvatar
+            v-else-if="applicationDetail?.name"
+            :name="applicationDetail?.name"
+            pinyinColor
+            shape="square"
+            :size="32"
+          />
+        </div>
+
+        <h4>{{ applicationDetail?.name }}</h4>
+      </div>
     </div>
     <div class="flex">
       <div class="chat-pc__left border-r">
@@ -23,12 +43,22 @@
                 v-loading="left_loading"
                 :defaultActive="currentChatId"
                 @click="clickListHandle"
+                @mouseenter="mouseenter"
+                @mouseleave="mouseId = ''"
               >
                 <template #default="{ row }">
-                  <auto-tooltip :content="row.abstract">
-                    {{ row.abstract }}
-                  </auto-tooltip>
+                  <div class="flex-between">
+                    <auto-tooltip :content="row.abstract">
+                      {{ row.abstract }}
+                    </auto-tooltip>
+                    <div @click.stop v-if="mouseId === row.id && row.id !== 'new'">
+                      <el-button style="padding: 0" link @click.stop="deleteLog(row)">
+                        <el-icon><Delete /></el-icon>
+                      </el-button>
+                    </div>
+                  </div>
                 </template>
+
                 <template #empty>
                   <div class="text-center">
                     <el-text type="info">暂无历史记录</el-text>
@@ -49,20 +79,6 @@
           </h4>
 
           <span class="flex align-center" v-if="currentRecordList.length">
-            <el-dropdown class="mr-8">
-              <AppIcon
-                iconName="takeaway-box"
-                class="info mr-8"
-                style="font-size: 16px"
-                title="导出聊天记录"
-              ></AppIcon>
-              <template #dropdown>
-                <el-dropdown-menu>
-                  <el-dropdown-item @click="exportMarkdown">导出 Markdown</el-dropdown-item>
-                  <el-dropdown-item @click="exportHTML">导出 HTML</el-dropdown-item>
-                </el-dropdown-menu>
-              </template>
-            </el-dropdown>
             <AppIcon
               v-if="paginationConfig.total"
               iconName="app-chat-record"
@@ -72,9 +88,18 @@
             <span v-if="paginationConfig.total" class="lighter">
               {{ paginationConfig.total }} 条提问
             </span>
+            <el-dropdown class="ml-8">
+              <AppIcon iconName="app-export" class="cursor" title="导出聊天记录"></AppIcon>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item @click="exportMarkdown">导出 Markdown</el-dropdown-item>
+                  <el-dropdown-item @click="exportHTML">导出 HTML</el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
           </span>
         </div>
-        <div class="right-height chat-width">
+        <div class="right-height">
           <!-- 对话 -->
           <AiChat
             ref="AiChatRef"
@@ -85,7 +110,8 @@
             :chatId="currentChatId"
             @refresh="refresh"
             @scroll="handleScroll"
-          ></AiChat>
+          >
+          </AiChat>
         </div>
       </div>
     </div>
@@ -102,7 +128,7 @@ import { reactive, ref, onMounted, nextTick, computed } from 'vue'
 import { useRoute } from 'vue-router'
 import { marked } from 'marked'
 import { saveAs } from 'file-saver'
-import applicationApi from '@/api/application'
+import { isAppIcon } from '@/utils/application'
 import useStore from '@/stores'
 
 import useResize from '@/layout/hooks/useResize'
@@ -115,6 +141,10 @@ const {
 } = route as any
 
 const { application, user, log, common } = useStore()
+
+const isDefaultTheme = computed(() => {
+  return user.isDefaultTheme()
+})
 
 const isCollapse = ref(false)
 
@@ -147,6 +177,23 @@ const paginationConfig = ref({
 const currentRecordList = ref<any>([])
 const currentChatId = ref('new') // 当前历史记录Id 默认为'new'
 const currentChatName = ref('新建对话')
+const mouseId = ref('')
+
+function mouseenter(row: any) {
+  mouseId.value = row.id
+}
+function deleteLog(row: any) {
+  log.asyncDelChatClientLog(applicationDetail.value.id, row.id, left_loading).then(() => {
+    if (currentChatId.value === row.id) {
+      currentChatId.value = 'new'
+      currentChatName.value = '新建对话'
+      paginationConfig.value.current_page = 1
+      paginationConfig.value.total = 0
+      currentRecordList.value = []
+    }
+    getChatLog(applicationDetail.value.id)
+  })
+}
 
 function handleScroll(event: any) {
   if (
@@ -166,19 +213,21 @@ function getAccessToken(token: string) {
   application
     .asyncAppAuthentication(token, loading)
     .then(() => {
-      getProfile()
+      getAppProfile()
     })
     .catch(() => {
       applicationAvailable.value = false
     })
 }
 
-function getProfile() {
-  applicationApi
-    .getProfile(loading)
-    .then((res) => {
+function getAppProfile() {
+  application
+    .asyncGetAppProfile(loading)
+    .then((res: any) => {
       applicationDetail.value = res.data
-      getChatLog(applicationDetail.value.id)
+      if (res.data?.show_history) {
+        getChatLog(applicationDetail.value.id)
+      }
     })
     .catch(() => {
       applicationAvailable.value = false
@@ -294,7 +343,6 @@ onMounted(() => {
 </script>
 <style lang="scss">
 .chat-pc {
-  background-color: var(--app-layout-bg-color);
   overflow: hidden;
 
   &__header {
@@ -367,10 +415,6 @@ onMounted(() => {
     }
   }
 
-  .chat-width {
-    max-width: var(--app-chat-width, 860px);
-    margin: 0 auto;
-  }
   .collapse {
     display: none;
   }
@@ -380,9 +424,6 @@ onMounted(() => {
   .chat-pc {
     &__right {
       width: 100%;
-      .right-height {
-        height: calc(100vh - var(--app-header-height) * 2 - 24px - env(safe-area-inset-bottom));
-      }
     }
     &__left {
       display: none;

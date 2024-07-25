@@ -64,6 +64,18 @@ class ChatView(APIView):
             return result.success(ChatSerializers.OpenChat(
                 data={'user_id': request.user.id, 'application_id': application_id}).open())
 
+    class OpenWorkFlowTemp(APIView):
+        authentication_classes = [TokenAuth]
+
+        @action(methods=['POST'], detail=False)
+        @swagger_auto_schema(operation_summary="获取工作流临时会话id",
+                             operation_id="获取工作流临时会话id",
+                             request_body=ChatApi.OpenWorkFlowTemp.get_request_body_api(),
+                             tags=["应用/会话"])
+        def post(self, request: Request):
+            return result.success(ChatSerializers.OpenWorkFlowChat(
+                data={**request.data, 'user_id': request.user.id}).open())
+
     class OpenTemp(APIView):
         authentication_classes = [TokenAuth]
 
@@ -159,6 +171,25 @@ class ChatView(APIView):
                 data={'client_id': request.auth.client_id, 'application_id': application_id}).page(
                 current_page=current_page,
                 page_size=page_size))
+
+        class Operate(APIView):
+            authentication_classes = [TokenAuth]
+
+            @action(methods=['DELETE'], detail=False)
+            @swagger_auto_schema(operation_summary="客户端删除对话",
+                                 operation_id="客户端删除对话",
+                                 tags=["应用/对话日志"])
+            @has_permissions(ViewPermission(
+                [RoleConstants.APPLICATION_ACCESS_TOKEN],
+                [lambda r, keywords: Permission(group=Group.APPLICATION, operate=Operate.USE,
+                                                dynamic_tag=keywords.get('application_id'))],
+                compare=CompareConstants.AND),
+                compare=CompareConstants.AND)
+            def delete(self, request: Request, application_id: str, chat_id: str):
+                return result.success(
+                    ChatSerializers.Operate(
+                        data={'application_id': application_id, 'user_id': request.user.id,
+                              'chat_id': chat_id}).logic_delete())
 
     class Page(APIView):
         authentication_classes = [TokenAuth]

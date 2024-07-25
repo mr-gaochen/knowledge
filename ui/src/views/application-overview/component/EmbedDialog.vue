@@ -1,13 +1,22 @@
 <template>
-  <el-dialog title="嵌入第三方" v-model="dialogVisible" width="900" class="embed-dialog">
+  <el-dialog
+    :title="$t('views.applicationOverview.appInfo.EmbedDialog.embedDialogTitle')"
+    v-model="dialogVisible"
+    width="900"
+    class="embed-dialog"
+  >
     <el-row :gutter="12">
       <el-col :span="12">
         <div class="border">
-          <p class="title p-16 bold">全屏模式</p>
+          <p class="title p-16 bold">
+            {{ $t('views.applicationOverview.appInfo.EmbedDialog.fullscreenModeTitle') }}
+          </p>
           <img src="@/assets/window1.png" alt="" class="ml-8" />
-          <div class="code border-t p-16">
+          <div class="code layout-bg border-t p-16">
             <div class="flex-between">
-              <span class="bold">复制以下代码进行嵌入</span>
+              <span class="bold">{{
+                $t('views.applicationOverview.appInfo.EmbedDialog.copyInstructions')
+              }}</span>
               <el-button text @click="copyClick(source1)">
                 <AppIcon iconName="app-copy"></AppIcon>
               </el-button>
@@ -20,11 +29,15 @@
       </el-col>
       <el-col :span="12">
         <div class="border">
-          <p class="title p-16 bold">浮窗模式</p>
+          <p class="title p-16 bold">
+            {{ $t('views.applicationOverview.appInfo.EmbedDialog.floatingModeTitle') }}
+          </p>
           <img src="@/assets/window2.png" alt="" class="ml-8" />
           <div class="code border-t p-16">
             <div class="flex-between">
-              <span class="bold">复制以下代码进行嵌入</span>
+              <span class="bold">{{
+                $t('views.applicationOverview.appInfo.EmbedDialog.copyInstructions')
+              }}</span>
               <el-button text @click="copyClick(source2)">
                 <AppIcon iconName="app-copy"></AppIcon>
               </el-button>
@@ -61,15 +74,15 @@ watch(dialogVisible, (bool) => {
 })
 
 const open = (val: string) => {
-  source1.value = `<iframe 
+  source1.value = `<iframe
 src="${application.location + val}"
-style="width: 100%; height: 100%;" 
-frameborder="0" 
+style="width: 100%; height: 100%;"
+frameborder="0"
 allow="microphone">
 </iframe>
 `
 
-  source2.value = `<script 
+  source2.value = `<script
 async
 defer
 src="${window.location.origin}/api/application/embed?protocol=${window.location.protocol.replace(
@@ -91,7 +104,7 @@ defineExpose({ open })
 
   .code {
     color: var(--app-text-color) !important;
-    background: var(--app-layout-bg-color);
+
     font-weight: 400;
     font-size: 13px;
     white-space: pre;

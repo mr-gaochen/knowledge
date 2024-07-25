@@ -45,8 +45,7 @@ const postApplication: (
 
 /**
  * 修改应用
- * @param 参数 
-
+ * @param 参数
  */
 const putApplication: (
   application_id: String,
@@ -136,7 +135,7 @@ const postAppAuthentication: (access_token: string, loading?: Ref<boolean>) => P
   "access_token": "string"
 }
  */
-const getProfile: (loading?: Ref<boolean>) => Promise<any> = (loading) => {
+const getAppProfile: (loading?: Ref<boolean>) => Promise<any> = (loading) => {
   return get(`${prefix}/profile`, undefined, loading)
 }
 
@@ -148,6 +147,16 @@ const getProfile: (loading?: Ref<boolean>) => Promise<any> = (loading) => {
  */
 const postChatOpen: (data: ApplicationFormType) => Promise<Result<any>> = (data) => {
   return post(`${prefix}/chat/open`, data)
+}
+
+/**
+ * 获得工作流临时回话Id
+ * @param 参数 
+
+}
+ */
+const postWorkflowChatOpen: (data: ApplicationFormType) => Promise<Result<any>> = (data) => {
+  return post(`${prefix}/chat_workflow/open`, data)
 }
 
 /**
@@ -228,6 +237,18 @@ const getApplicationModel: (
   return get(`${prefix}/${application_id}/model`, loading)
 }
 
+/**
+ * 发布应用
+ * @param 参数
+ */
+const putPublishApplication: (
+  application_id: String,
+  data: ApplicationFormType,
+  loading?: Ref<boolean>
+) => Promise<Result<any>> = (application_id, data, loading) => {
+  return put(`${prefix}/${application_id}/publish`, data, undefined, loading)
+}
+
 export default {
   getAllAppilcation,
   getApplication,
@@ -242,8 +263,10 @@ export default {
   getAccessToken,
   putAccessToken,
   postAppAuthentication,
-  getProfile,
+  getAppProfile,
   putChatVote,
   getApplicationHitTest,
-  getApplicationModel
+  getApplicationModel,
+  putPublishApplication,
+  postWorkflowChatOpen
 }

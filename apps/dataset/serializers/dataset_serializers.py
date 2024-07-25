@@ -12,30 +12,32 @@ import re
 import traceback
 import uuid
 from functools import reduce
-from typing import Dict
+from typing import Dict, List
 from urllib.parse import urlparse
 
 from django.contrib.postgres.fields import ArrayField
 from django.core import validators
 from django.db import transaction, models
-from django.db.models import QuerySet, Q
+from django.db.models import QuerySet
+from django.http import HttpResponse
 from drf_yasg import openapi
 from rest_framework import serializers
 
 from application.models import ApplicationDatasetMapping
-from common.config.embedding_config import VectorStore, EmbeddingModel
+from common.config.embedding_config import VectorStore
 from common.db.search import get_dynamics_model, native_page_search, native_search
 from common.db.sql_execute import select_list
 from common.event import ListenerManagement, SyncWebDatasetArgs
 from common.exception.app_exception import AppApiException
 from common.mixins.api_mixin import ApiMixin
-from common.util.common import post
+from common.util.common import post, flat_map, valid_license
 from common.util.field_message import ErrMessage
 from common.util.file_util import get_file_content
 from common.util.fork import ChildLink, Fork
 from common.util.split_model import get_split_model
 from dataset.models.data_set import DataSet, Document, Paragraph, Problem, Type, ProblemParagraphMapping
-from dataset.serializers.common_serializers import list_paragraph, MetaSerializer
+from dataset.serializers.common_serializers import list_paragraph, MetaSerializer, ProblemParagraphManage, \
+    get_embedding_model_by_dataset_id
 from dataset.serializers.document_serializers import DocumentSerializers, DocumentInstanceSerializer
 from embedding.models import SearchMode
 from setting.models import AuthOperate
@@ -204,11 +206,84 @@ class DataSetSerializers(serializers.ModelSerializer):
                                          max_length=256,
                                          min_length=1)
 
+            embedding_mode_id = serializers.UUIDField(required=True, error_messages=ErrMessage.uuid("向量模型"))
+
             documents = DocumentInstanceSerializer(required=False, many=True)
 
             def is_valid(self, *, raise_exception=False):
                 super().is_valid(raise_exception=True)
                 return True
+
+        class CreateQASerializers(serializers.Serializer):
+            """
+            创建web站点序列化对象
+            """
+            name = serializers.CharField(required=True,
+                                         error_messages=ErrMessage.char("知识库名称"),
+                                         max_length=64,
+                                         min_length=1)
+
+            desc = serializers.CharField(required=True,
+                                         error_messages=ErrMessage.char("知识库描述"),
+                                         max_length=256,
+                                         min_length=1)
+
+            embedding_mode_id = serializers.UUIDField(required=True, error_messages=ErrMessage.uuid("向量模型"))
+
+            file_list = serializers.ListSerializer(required=True,
+                                                   error_messages=ErrMessage.list("文件列表"),
+                                                   child=serializers.FileField(required=True,
+                                                                               error_messages=ErrMessage.file("文件")))
+
+            @staticmethod
+            def get_request_params_api():
+                return [openapi.Parameter(name='file',
+                                          in_=openapi.IN_FORM,
+                                          type=openapi.TYPE_ARRAY,
+                                          items=openapi.Items(type=openapi.TYPE_FILE),
+                                          required=True,
+                                          description='上传文件'),
+                        openapi.Parameter(name='name',
+                                          in_=openapi.IN_FORM,
+                                          required=True,
+                                          type=openapi.TYPE_STRING, title="知识库名称", description="知识库名称"),
+                        openapi.Parameter(name='desc',
+                                          in_=openapi.IN_FORM,
+                                          required=True,
+                                          type=openapi.TYPE_STRING, title="知识库描述", description="知识库描述"),
+                        ]
+
+            @staticmethod
+            def get_response_body_api():
+                return openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    required=['id', 'name', 'desc', 'user_id', 'char_length', 'document_count',
+                              'update_time', 'create_time', 'document_list'],
+                    properties={
+                        'id': openapi.Schema(type=openapi.TYPE_STRING, title="id",
+                                             description="id", default="xx"),
+                        'name': openapi.Schema(type=openapi.TYPE_STRING, title="名称",
+                                               description="名称", default="测试知识库"),
+                        'desc': openapi.Schema(type=openapi.TYPE_STRING, title="描述",
+                                               description="描述", default="测试知识库描述"),
+                        'user_id': openapi.Schema(type=openapi.TYPE_STRING, title="所属用户id",
+                                                  description="所属用户id", default="user_xxxx"),
+                        'char_length': openapi.Schema(type=openapi.TYPE_STRING, title="字符数",
+                                                      description="字符数", default=10),
+                        'document_count': openapi.Schema(type=openapi.TYPE_STRING, title="文档数量",
+                                                         description="文档数量", default=1),
+                        'update_time': openapi.Schema(type=openapi.TYPE_STRING, title="修改时间",
+                                                      description="修改时间",
+                                                      default="1970-01-01 00:00:00"),
+                        'create_time': openapi.Schema(type=openapi.TYPE_STRING, title="创建时间",
+                                                      description="创建时间",
+                                                      default="1970-01-01 00:00:00"
+                                                      ),
+                        'document_list': openapi.Schema(type=openapi.TYPE_ARRAY, title="文档列表",
+                                                        description="文档列表",
+                                                        items=DocumentSerializers.Operate.get_response_body_api())
+                    }
+                )
 
         class CreateWebSerializers(serializers.Serializer):
             """
@@ -224,6 +299,8 @@ class DataSetSerializers(serializers.ModelSerializer):
                                          max_length=256,
                                          min_length=1)
             source_url = serializers.CharField(required=True, error_messages=ErrMessage.char("Web 根地址"), )
+
+            embedding_mode_id = serializers.UUIDField(required=True, error_messages=ErrMessage.uuid("向量模型"))
 
             selector = serializers.CharField(required=False, allow_null=True, allow_blank=True,
                                              error_messages=ErrMessage.char("选择器"))
@@ -276,6 +353,8 @@ class DataSetSerializers(serializers.ModelSerializer):
                     properties={
                         'name': openapi.Schema(type=openapi.TYPE_STRING, title="知识库名称", description="知识库名称"),
                         'desc': openapi.Schema(type=openapi.TYPE_STRING, title="知识库描述", description="知识库描述"),
+                        'embedding_mode_id': openapi.Schema(type=openapi.TYPE_STRING, title="向量模型id",
+                                                            description="向量模型id"),
                         'source_url': openapi.Schema(type=openapi.TYPE_STRING, title="web站点url",
                                                      description="web站点url"),
                         'selector': openapi.Schema(type=openapi.TYPE_STRING, title="选择器", description="选择器")
@@ -284,10 +363,23 @@ class DataSetSerializers(serializers.ModelSerializer):
 
         @staticmethod
         def post_embedding_dataset(document_list, dataset_id):
+            model = get_embedding_model_by_dataset_id(dataset_id)
             # 发送向量化事件
-            ListenerManagement.embedding_by_dataset_signal.send(dataset_id)
+            ListenerManagement.embedding_by_dataset_signal.send(dataset_id, embedding_model=model)
             return document_list
 
+        def save_qa(self, instance: Dict, with_valid=True):
+            if with_valid:
+                self.is_valid(raise_exception=True)
+                self.CreateQASerializers(data=instance).is_valid()
+            file_list = instance.get('file_list')
+            document_list = flat_map([DocumentSerializers.Create.parse_qa_file(file) for file in file_list])
+            dataset_instance = {'name': instance.get('name'), 'desc': instance.get('desc'), 'documents': document_list,
+                                'embedding_mode_id': instance.get('embedding_mode_id')}
+            return self.save(dataset_instance, with_valid=True)
+
+        @valid_license(model=DataSet, count=50,
+                       message='社区版最多支持 50 个知识库，如需拥有更多知识库，请联系我们（https://fit2cloud.com/）。')
         @post(post_function=post_embedding_dataset)
         @transaction.atomic
         def save(self, instance: Dict, with_valid=True):
@@ -299,12 +391,12 @@ class DataSetSerializers(serializers.ModelSerializer):
             if QuerySet(DataSet).filter(user_id=user_id, name=instance.get('name')).exists():
                 raise AppApiException(500, "知识库名称重复!")
             dataset = DataSet(
-                **{'id': dataset_id, 'name': instance.get("name"), 'desc': instance.get('desc'), 'user_id': user_id})
+                **{'id': dataset_id, 'name': instance.get("name"), 'desc': instance.get('desc'), 'user_id': user_id,
+                   'embedding_mode_id': instance.get('embedding_mode_id')})
 
             document_model_list = []
             paragraph_model_list = []
-            problem_model_list = []
-            problem_paragraph_mapping_list = []
+            problem_paragraph_object_list = []
             # 插入文档
             for document in instance.get('documents') if 'documents' in instance else []:
                 document_paragraph_dict_model = DocumentSerializers.Create.get_document_paragraph_model(dataset_id,
@@ -312,12 +404,12 @@ class DataSetSerializers(serializers.ModelSerializer):
                 document_model_list.append(document_paragraph_dict_model.get('document'))
                 for paragraph in document_paragraph_dict_model.get('paragraph_model_list'):
                     paragraph_model_list.append(paragraph)
-                for problem in document_paragraph_dict_model.get('problem_model_list'):
-                    problem_model_list.append(problem)
-                for problem_paragraph_mapping in document_paragraph_dict_model.get('problem_paragraph_mapping_list'):
-                    problem_paragraph_mapping_list.append(problem_paragraph_mapping)
-            problem_model_list, problem_paragraph_mapping_list = DocumentSerializers.Create.reset_problem_model(
-                problem_model_list, problem_paragraph_mapping_list)
+                for problem_paragraph_object in document_paragraph_dict_model.get('problem_paragraph_object_list'):
+                    problem_paragraph_object_list.append(problem_paragraph_object)
+
+            problem_model_list, problem_paragraph_mapping_list = (ProblemParagraphManage(problem_paragraph_object_list,
+                                                                                         dataset_id)
+                                                                  .to_problem_model_list())
             # 插入知识库
             dataset.save()
             # 插入文档
@@ -371,7 +463,8 @@ class DataSetSerializers(serializers.ModelSerializer):
             dataset = DataSet(
                 **{'id': dataset_id, 'name': instance.get("name"), 'desc': instance.get('desc'), 'user_id': user_id,
                    'type': Type.web,
-                   'meta': {'source_url': instance.get('source_url'), 'selector': instance.get('selector')}})
+                   'meta': {'source_url': instance.get('source_url'), 'selector': instance.get('selector'),
+                            'embedding_mode_id': instance.get('embedding_mode_id')}})
             dataset.save()
             ListenerManagement.sync_web_dataset_signal.send(
                 SyncWebDatasetArgs(str(dataset_id), instance.get('source_url'), instance.get('selector'),
@@ -419,6 +512,8 @@ class DataSetSerializers(serializers.ModelSerializer):
                 properties={
                     'name': openapi.Schema(type=openapi.TYPE_STRING, title="知识库名称", description="知识库名称"),
                     'desc': openapi.Schema(type=openapi.TYPE_STRING, title="知识库描述", description="知识库描述"),
+                    'embedding_mode_id': openapi.Schema(type=openapi.TYPE_STRING, title='向量模型',
+                                                        description='向量模型'),
                     'documents': openapi.Schema(type=openapi.TYPE_ARRAY, title="文档数据", description="文档数据",
                                                 items=DocumentSerializers().Create.get_request_body_api()
                                                 )
@@ -455,9 +550,9 @@ class DataSetSerializers(serializers.ModelSerializer):
         id = serializers.CharField(required=True, error_messages=ErrMessage.char("id"))
         user_id = serializers.UUIDField(required=False, error_messages=ErrMessage.char("用户id"))
         query_text = serializers.CharField(required=True, error_messages=ErrMessage.char("查询文本"))
-        top_number = serializers.IntegerField(required=True, max_value=10, min_value=1,
+        top_number = serializers.IntegerField(required=True, max_value=100, min_value=1,
                                               error_messages=ErrMessage.char("响应Top"))
-        similarity = serializers.FloatField(required=True, max_value=1, min_value=0,
+        similarity = serializers.FloatField(required=True, max_value=2, min_value=0,
                                             error_messages=ErrMessage.char("相似度"))
         search_mode = serializers.CharField(required=True, validators=[
             validators.RegexValidator(regex=re.compile("^embedding|keywords|blend$"),
@@ -476,12 +571,13 @@ class DataSetSerializers(serializers.ModelSerializer):
                                         QuerySet(Document).filter(
                                             dataset_id=self.data.get('id'),
                                             is_active=False)]
+            model = get_embedding_model_by_dataset_id(self.data.get('id'))
             # 向量库检索
             hit_list = vector.hit_test(self.data.get('query_text'), [self.data.get('id')], exclude_document_id_list,
                                        self.data.get('top_number'),
                                        self.data.get('similarity'),
                                        SearchMode(self.data.get('search_mode')),
-                                       EmbeddingModel.get_embedding_model())
+                                       model)
             hit_dict = reduce(lambda x, y: {**x, **y}, [{hit.get('paragraph_id'): hit} for hit in hit_list], {})
             p_list = list_paragraph([h.get('paragraph_id') for h in hit_list])
             return [{**p, 'similarity': hit_dict.get(p.get('id')).get('similarity'),
@@ -590,6 +686,50 @@ class DataSetSerializers(serializers.ModelSerializer):
             if not QuerySet(DataSet).filter(id=self.data.get("id")).exists():
                 raise AppApiException(300, "id不存在")
 
+        def export_excel(self, with_valid=True):
+            if with_valid:
+                self.is_valid(raise_exception=True)
+            document_list = QuerySet(Document).filter(dataset_id=self.data.get('id'))
+            paragraph_list = native_search(QuerySet(Paragraph).filter(dataset_id=self.data.get("id")), get_file_content(
+                os.path.join(PROJECT_DIR, "apps", "dataset", 'sql', 'list_paragraph_document_name.sql')))
+            problem_mapping_list = native_search(
+                QuerySet(ProblemParagraphMapping).filter(dataset_id=self.data.get("id")), get_file_content(
+                    os.path.join(PROJECT_DIR, "apps", "dataset", 'sql', 'list_problem_mapping.sql')),
+                with_table_name=True)
+            data_dict, document_dict = DocumentSerializers.Operate.merge_problem(paragraph_list, problem_mapping_list,
+                                                                                 document_list)
+            workbook = DocumentSerializers.Operate.get_workbook(data_dict, document_dict)
+            response = HttpResponse(content_type='application/vnd.ms-excel')
+            response['Content-Disposition'] = 'attachment; filename="dataset.xls"'
+            workbook.save(response)
+            return response
+
+        @staticmethod
+        def merge_problem(paragraph_list: List[Dict], problem_mapping_list: List[Dict]):
+            result = {}
+            document_dict = {}
+
+            for paragraph in paragraph_list:
+                problem_list = [problem_mapping.get('content') for problem_mapping in problem_mapping_list if
+                                problem_mapping.get('paragraph_id') == paragraph.get('id')]
+                document_sheet = result.get(paragraph.get('document_id'))
+                d = document_dict.get(paragraph.get('document_name'))
+                if d is None:
+                    document_dict[paragraph.get('document_name')] = {paragraph.get('document_id')}
+                else:
+                    d.add(paragraph.get('document_id'))
+
+                if document_sheet is None:
+                    result[paragraph.get('document_id')] = [[paragraph.get('title'), paragraph.get('content'),
+                                                             '\n'.join(problem_list)]]
+                else:
+                    document_sheet.append([paragraph.get('title'), paragraph.get('content'), '\n'.join(problem_list)])
+            result_document_dict = {}
+            for d_name in document_dict:
+                for index, d_id in enumerate(document_dict.get(d_name)):
+                    result_document_dict[d_id] = d_name if index == 0 else d_name + str(index)
+            return result, result_document_dict
+
         @transaction.atomic
         def delete(self):
             self.is_valid()
@@ -601,6 +741,12 @@ class DataSetSerializers(serializers.ModelSerializer):
             dataset.delete()
             ListenerManagement.delete_embedding_by_dataset_signal.send(self.data.get('id'))
             return True
+
+        def re_embedding(self, with_valid=True):
+            if with_valid:
+                self.is_valid(raise_exception=True)
+            model = get_embedding_model_by_dataset_id(self.data.get('id'))
+            ListenerManagement.embedding_by_dataset_signal.send(self.data.get('id'), embedding_model=model)
 
         def list_application(self, with_valid=True):
             if with_valid:
@@ -639,6 +785,7 @@ class DataSetSerializers(serializers.ModelSerializer):
                             QuerySet(ApplicationDatasetMapping).filter(
                                 dataset_id=self.data.get('id'))]))}
 
+        @transaction.atomic
         def edit(self, dataset: Dict, user_id: str):
             """
             修改知识库
@@ -652,6 +799,8 @@ class DataSetSerializers(serializers.ModelSerializer):
                 raise AppApiException(500, "知识库名称重复!")
             _dataset = QuerySet(DataSet).get(id=self.data.get("id"))
             DataSetSerializers.Edit(data=dataset).is_valid(dataset=_dataset)
+            if 'embedding_mode_id' in dataset:
+                _dataset.embedding_mode_id = dataset.get('embedding_mode_id')
             if "name" in dataset:
                 _dataset.name = dataset.get("name")
             if 'desc' in dataset:
