@@ -8,7 +8,7 @@ EMAIL_HOST_USER:
 EMAIL_HOST_PASSWORD:
 
 # 数据库链接信息
-DB_NAME: knowledge
+DB_NAME: knowledge_latest
 DB_HOST: localhost
 DB_PORT: 5432
 DB_USER: root
@@ -21,5 +21,5 @@ TIME_ZONE: Asia/Shanghai
 
 
  # 模型相关配置
- EMBEDDING_MODEL_PATH: model
- EMBEDDING_MODEL_NAME: model/shibing624_text2vec-base-chinese
+EMBEDDING_MODEL_PATH: model
+EMBEDDING_MODEL_NAME: model/shibing624_text2vec-base-chinese
